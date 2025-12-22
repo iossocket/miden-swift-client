@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+Cargo.lock
+
+# iOS build artifacts
+/build
+*.xcframework
+*.framework
+
+# Xcode
+.DS_Store
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

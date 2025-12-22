@@ -1,0 +1,20 @@
+# Cargo configuration file
+# Auto-generated - Set minimum deployment version for iOS build targets
+
+[target.aarch64-apple-ios]
+# iOS device (arm64)
+rustflags = [
+    "-C", "link-arg=-miphoneos-version-min=18.5",
+]
+
+[target.aarch64-apple-ios-sim]
+# iOS simulator (arm64, Apple Silicon)
+rustflags = [
+    "-C", "link-arg=-mios-simulator-version-min=18.5",
+]
+
+[target.x86_64-apple-ios]
+# iOS simulator (x86_64, Intel Mac) - if support needed
+rustflags = [
+    "-C", "link-arg=-mios-simulator-version-min=18.5",
+]
