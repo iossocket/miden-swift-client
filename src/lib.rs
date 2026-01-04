@@ -11,6 +11,7 @@ use std::{
 use once_cell::sync::OnceCell;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 use miden_client::{
     account::component::BasicWallet,
@@ -67,7 +68,55 @@ struct MidenContext {
 }
 
 /// Opaque handle type
-pub type MidenHandle = *mut MidenContext;
+/// Points to Arc<Mutex<MidenContext>> for thread-safe access
+pub type MidenHandle = *mut Arc<Mutex<MidenContext>>;
+
+// ================================================================================================
+// Async Callback Types
+// ================================================================================================
+
+/// Callback for sync operation: (user_data, error_code, block_num)
+pub type SyncCallback = extern "C" fn(*mut std::ffi::c_void, i32, u32);
+
+/// Callback for create wallet operation: (user_data, error_code, account_id_ptr, account_id_len)
+/// Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
+pub type CreateWalletCallback = extern "C" fn(*mut std::ffi::c_void, i32, *mut u8, usize);
+
+/// Callback for get accounts operation: (user_data, error_code, json_ptr, json_len)
+/// Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
+pub type GetAccountsCallback = extern "C" fn(*mut std::ffi::c_void, i32, *mut u8, usize);
+
+/// Callback for get balance operation: (user_data, error_code, json_ptr, json_len)
+/// Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
+pub type GetBalanceCallback = extern "C" fn(*mut std::ffi::c_void, i32, *mut u8, usize);
+
+/// Callback for get input notes operation: (user_data, error_code, json_ptr, json_len)
+/// Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
+pub type GetInputNotesCallback = extern "C" fn(*mut std::ffi::c_void, i32, *mut u8, usize);
+
+/// Callback for consume notes operation: (user_data, error_code, tx_id_ptr, tx_id_len)
+/// Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
+pub type ConsumeNotesCallback = extern "C" fn(*mut std::ffi::c_void, i32, *mut u8, usize);
+
+/// Callback for test connection operation: (user_data, error_code)
+pub type TestConnectionCallback = extern "C" fn(*mut std::ffi::c_void, i32);
+
+// ================================================================================================
+// Memory Management for FFI
+// ================================================================================================
+
+/// Free bytes allocated by Rust (for async callback results)
+/// 
+/// Swift must call this to free data returned via async callbacks
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_bytes_free(ptr: *mut u8, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Vec::from_raw_parts(ptr, len, len));
+    }
+}
 
 // ================================================================================================
 // Miden Client FFI Interface
@@ -135,7 +184,8 @@ pub extern "C" fn wc_miden_create(
 
     match result {
         Ok(context) => {
-            let boxed = Box::new(context);
+            let ctx = Arc::new(Mutex::new(context));
+            let boxed = Box::new(ctx);
             unsafe { *handle_out = Box::into_raw(boxed) };
             0
         }
@@ -215,10 +265,11 @@ pub extern "C" fn wc_miden_sync(handle: MidenHandle, block_num_out: *mut u32) ->
         return -1;
     }
 
-    let context = unsafe { &mut *handle };
+    let context = unsafe { &*handle };
     
     let result = block_on(async {
-        context.client.sync_state().await
+        let mut ctx = context.lock().await;
+        ctx.client.sync_state().await
     });
 
     match result {
@@ -228,8 +279,58 @@ pub extern "C" fn wc_miden_sync(handle: MidenHandle, block_num_out: *mut u32) ->
             }
             0
         }
-        Err(_) => -2,
+        Err(e) => {
+            eprintln!("[wc_miden_sync] sync_state failed: {:?}", e);
+            -2
+        }
     }
+}
+
+/// Async version of sync state
+/// 
+/// # Parameters
+/// - `handle`: Client handle
+/// - `callback`: Callback function (user_data, error_code, block_num)
+/// - `user_data`: User data passed to callback
+/// 
+/// # Returns
+/// - 0: Task started successfully
+/// - -1: Invalid handle or callback
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_miden_sync_async(
+    handle: MidenHandle,
+    callback: SyncCallback,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    // Convert handle to usize for thread transfer (caller must ensure handle remains valid)
+    let handle_usize = handle as usize;
+    let user_data_usize = user_data as usize;
+
+    std::thread::spawn(move || {
+        let handle = handle_usize as MidenHandle;
+        let context = unsafe { &*handle };
+        
+        let result = block_on(async {
+            let mut ctx = context.lock().await;
+            ctx.client.sync_state().await
+        });
+
+        let user_data_ptr = user_data_usize as *mut std::ffi::c_void;
+        match result {
+            Ok(summary) => {
+                callback(user_data_ptr, 0, summary.block_num.as_u32());
+            }
+            Err(_) => {
+                callback(user_data_ptr, -2, 0);
+            }
+        }
+    });
+
+    0
 }
 
 /// Create a new Miden wallet account
@@ -279,10 +380,12 @@ pub extern "C" fn wc_miden_create_wallet(
         arr
     };
 
-    let context = unsafe { &mut *handle };
+    let context = unsafe { &*handle };
     
     let result = block_on(async {
-        create_wallet_async(&mut context.client, &context.keystore, init_seed).await
+        let mut ctx = context.lock().await;
+        let keystore = ctx.keystore.clone();
+        create_wallet_async(&mut ctx.client, &keystore, init_seed).await
     });
 
     match result {
@@ -303,6 +406,80 @@ pub extern "C" fn wc_miden_create_wallet(
         }
         Err(_) => -3,
     }
+}
+
+/// Async version of create wallet
+/// 
+/// # Parameters
+/// - `handle`: Client handle
+/// - `seed_ptr`: 32-byte random seed (if NULL, auto-generated)
+/// - `seed_len`: Seed length (must be 32, ignored if seed_ptr is NULL)
+/// - `callback`: Callback function (user_data, error_code, account_id_ptr, account_id_len)
+/// - `user_data`: User data passed to callback
+/// 
+/// # Returns
+/// - 0: Task started successfully
+/// - -1: Invalid parameters
+/// - -2: Invalid handle
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_miden_create_wallet_async(
+    handle: MidenHandle,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    callback: CreateWalletCallback,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -2;
+    }
+
+    // Get or generate seed
+    let init_seed: [u8; 32] = if seed_ptr.is_null() {
+        let mut seed = [0u8; 32];
+        let mut rng = StdRng::from_os_rng();
+        rng.fill_bytes(&mut seed);
+        seed
+    } else {
+        if seed_len != 32 {
+            return -1;
+        }
+        let seed = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(seed);
+        arr
+    };
+
+    let handle_usize = handle as usize;
+    let user_data_usize = user_data as usize;
+
+    std::thread::spawn(move || {
+        let handle = handle_usize as MidenHandle;
+        let context = unsafe { &*handle };
+        
+        let result = block_on(async {
+            let mut ctx = context.lock().await;
+            let keystore = ctx.keystore.clone();
+            create_wallet_async(&mut ctx.client, &keystore, init_seed).await
+        });
+
+        let user_data_ptr = user_data_usize as *mut std::ffi::c_void;
+        match result {
+            Ok(account) => {
+                let account_id_hex = account.id().to_hex();
+                // Allocate stable memory - Swift must call wc_bytes_free
+                let mut bytes = account_id_hex.into_bytes();
+                let ptr = bytes.as_mut_ptr();
+                let len = bytes.len();
+                std::mem::forget(bytes);
+                callback(user_data_ptr, 0, ptr, len);
+            }
+            Err(_) => {
+                callback(user_data_ptr, -3, std::ptr::null_mut(), 0);
+            }
+        }
+    });
+
+    0
 }
 
 /// Asynchronously create wallet
@@ -364,7 +541,8 @@ pub extern "C" fn wc_miden_get_accounts(
     let context = unsafe { &*handle };
     
     let result = block_on(async {
-        context.client.get_account_headers().await
+        let ctx = context.lock().await;
+        ctx.client.get_account_headers().await
     });
 
     match result {
@@ -395,6 +573,69 @@ pub extern "C" fn wc_miden_get_accounts(
         }
         Err(_) => -3,
     }
+}
+
+/// Async version of get accounts
+/// 
+/// # Parameters
+/// - `handle`: Client handle
+/// - `callback`: Callback function (user_data, error_code, json_ptr, json_len)
+/// - `user_data`: User data passed to callback
+/// 
+/// # Returns
+/// - 0: Task started successfully
+/// - -1: Invalid handle
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_miden_get_accounts_async(
+    handle: MidenHandle,
+    callback: GetAccountsCallback,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let handle_usize = handle as usize;
+    let user_data_usize = user_data as usize;
+
+    std::thread::spawn(move || {
+        let handle = handle_usize as MidenHandle;
+        let context = unsafe { &*handle };
+        
+        let result = block_on(async {
+            let ctx = context.lock().await;
+            ctx.client.get_account_headers().await
+        });
+
+        let user_data_ptr = user_data_usize as *mut std::ffi::c_void;
+        match result {
+            Ok(accounts) => {
+                let account_ids: Vec<String> = accounts
+                    .iter()
+                    .map(|(header, _status)| header.id().to_hex())
+                    .collect();
+                
+                let json = format!("[{}]", 
+                    account_ids.iter()
+                        .map(|id| format!("\"{}\"", id))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+
+                // Allocate stable memory - Swift must call wc_bytes_free
+                let mut bytes = json.into_bytes();
+                let ptr = bytes.as_mut_ptr();
+                let len = bytes.len();
+                std::mem::forget(bytes);
+                callback(user_data_ptr, 0, ptr, len);
+            }
+            Err(_) => {
+                callback(user_data_ptr, -3, std::ptr::null_mut(), 0);
+            }
+        }
+    });
+
+    0
 }
 
 /// Get account balance
@@ -456,7 +697,8 @@ pub extern "C" fn wc_miden_get_balance(
 
     // Get account information
     let result = block_on(async {
-        context.client.get_account(account_id).await
+        let ctx = context.lock().await;
+        ctx.client.get_account(account_id).await
     });
 
     match result {
@@ -507,6 +749,105 @@ pub extern "C" fn wc_miden_get_balance(
     }
 }
 
+/// Async version of get balance
+/// 
+/// # Parameters
+/// - `handle`: Client handle
+/// - `account_id_hex`: Account ID (hex string)
+/// - `callback`: Callback function (user_data, error_code, json_ptr, json_len)
+/// - `user_data`: User data passed to callback
+/// 
+/// # Returns
+/// - 0: Task started successfully
+/// - -1: Invalid parameters
+/// - -2: Invalid handle
+/// - -3: Account ID parsing failed
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_miden_get_balance_async(
+    handle: MidenHandle,
+    account_id_hex: *const c_char,
+    callback: GetBalanceCallback,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -2;
+    }
+    if account_id_hex.is_null() {
+        return -1;
+    }
+
+    // Parse account ID
+    let account_id_str = match unsafe { CStr::from_ptr(account_id_hex) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return -1,
+    };
+
+    let account_id = match AccountId::from_hex(&account_id_str) {
+        Ok(id) => id,
+        Err(_) => return -3,
+    };
+
+    let handle_usize = handle as usize;
+    let user_data_usize = user_data as usize;
+
+    std::thread::spawn(move || {
+        let handle = handle_usize as MidenHandle;
+        let context = unsafe { &*handle };
+        
+        let result = block_on(async {
+            let ctx = context.lock().await;
+            ctx.client.get_account(account_id).await
+        });
+
+        let user_data_ptr = user_data_usize as *mut std::ffi::c_void;
+        match result {
+            Ok(Some(account_record)) => {
+                let account = account_record.account();
+                let vault = account.vault();
+
+                let mut fungible_assets = Vec::new();
+                let mut non_fungible_count = 0u32;
+
+                for asset in vault.assets() {
+                    if asset.is_fungible() {
+                        let fungible = asset.unwrap_fungible();
+                        fungible_assets.push(format!(
+                            r#"{{"faucet_id":"{}","amount":{}}}"#,
+                            fungible.faucet_id().to_hex(),
+                            fungible.amount()
+                        ));
+                    } else {
+                        non_fungible_count += 1;
+                    }
+                }
+
+                let json = format!(
+                    r#"{{"account_id":"{}","fungible_assets":[{}],"total_fungible_count":{},"total_non_fungible_count":{}}}"#,
+                    account_id_str,
+                    fungible_assets.join(","),
+                    fungible_assets.len(),
+                    non_fungible_count
+                );
+
+                // Allocate stable memory - Swift must call wc_bytes_free
+                let mut bytes = json.into_bytes();
+                let ptr = bytes.as_mut_ptr();
+                let len = bytes.len();
+                std::mem::forget(bytes);
+                callback(user_data_ptr, 0, ptr, len);
+            }
+            Ok(None) => {
+                callback(user_data_ptr, -4, std::ptr::null_mut(), 0);
+            }
+            Err(_) => {
+                callback(user_data_ptr, -5, std::ptr::null_mut(), 0);
+            }
+        }
+    });
+
+    0
+}
+
 /// Test Miden Client connection
 /// 
 /// # Parameters
@@ -522,16 +863,59 @@ pub extern "C" fn wc_miden_test_connection(handle: MidenHandle) -> i32 {
         return -1;
     }
 
-    let context = unsafe { &mut *handle };
+    let context = unsafe { &*handle };
     
     let result = block_on(async {
-        context.client.sync_state().await
+        let mut ctx = context.lock().await;
+        ctx.client.sync_state().await
     });
 
     match result {
         Ok(_) => 0,
         Err(_) => -2,
     }
+}
+
+/// Async version of test connection
+/// 
+/// # Parameters
+/// - `handle`: Client handle
+/// - `callback`: Callback function (user_data, error_code)
+/// - `user_data`: User data passed to callback
+/// 
+/// # Returns
+/// - 0: Task started successfully
+/// - -1: Invalid handle
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_miden_test_connection_async(
+    handle: MidenHandle,
+    callback: TestConnectionCallback,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let handle_usize = handle as usize;
+    let user_data_usize = user_data as usize;
+
+    std::thread::spawn(move || {
+        let handle = handle_usize as MidenHandle;
+        let context = unsafe { &*handle };
+        
+        let result = block_on(async {
+            let mut ctx = context.lock().await;
+            ctx.client.sync_state().await
+        });
+
+        let user_data_ptr = user_data_usize as *mut std::ffi::c_void;
+        match result {
+            Ok(_) => callback(user_data_ptr, 0),
+            Err(_) => callback(user_data_ptr, -2),
+        }
+    });
+
+    0
 }
 
 /// Get consumable Input Notes
@@ -597,7 +981,8 @@ pub extern "C" fn wc_miden_get_input_notes(
 
     // Get consumable notes
     let result = block_on(async {
-        context.client.get_consumable_notes(account_id).await
+        let ctx = context.lock().await;
+        ctx.client.get_consumable_notes(account_id).await
     });
 
     match result {
@@ -653,6 +1038,110 @@ pub extern "C" fn wc_miden_get_input_notes(
         }
         Err(_) => -4,
     }
+}
+
+/// Async version of get input notes
+/// 
+/// # Parameters
+/// - `handle`: Client handle
+/// - `account_id_hex`: Account ID (hex string, can be NULL for all accounts)
+/// - `callback`: Callback function (user_data, error_code, json_ptr, json_len)
+/// - `user_data`: User data passed to callback
+/// 
+/// # Returns
+/// - 0: Task started successfully
+/// - -1: Invalid parameters
+/// - -2: Invalid handle
+/// - -3: Account ID parsing failed
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_miden_get_input_notes_async(
+    handle: MidenHandle,
+    account_id_hex: *const c_char,
+    callback: GetInputNotesCallback,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -2;
+    }
+
+    // Parse account ID (optional)
+    let account_id: Option<AccountId> = if account_id_hex.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(account_id_hex) }.to_str() {
+            Ok(s) if s.is_empty() => None,
+            Ok(s) => match AccountId::from_hex(s) {
+                Ok(id) => Some(id),
+                Err(_) => return -3,
+            },
+            Err(_) => return -1,
+        }
+    };
+
+    let handle_usize = handle as usize;
+    let user_data_usize = user_data as usize;
+
+    std::thread::spawn(move || {
+        let handle = handle_usize as MidenHandle;
+        let context = unsafe { &*handle };
+        
+        let result = block_on(async {
+            let ctx = context.lock().await;
+            ctx.client.get_consumable_notes(account_id).await
+        });
+
+        let user_data_ptr = user_data_usize as *mut std::ffi::c_void;
+        match result {
+            Ok(consumable_notes) => {
+                let notes_json: Vec<String> = consumable_notes
+                    .iter()
+                    .map(|(note_record, _consumability)| {
+                        let assets_json: Vec<String> = note_record
+                            .assets()
+                            .iter()
+                            .filter_map(|asset| {
+                                if asset.is_fungible() {
+                                    let fungible = asset.unwrap_fungible();
+                                    Some(format!(
+                                        r#"{{"faucet_id":"{}","amount":{}}}"#,
+                                        fungible.faucet_id().to_hex(),
+                                        fungible.amount()
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        format!(
+                            r#"{{"note_id":"{}","assets":[{}],"is_authenticated":{}}}"#,
+                            note_record.id().to_hex(),
+                            assets_json.join(","),
+                            note_record.is_authenticated()
+                        )
+                    })
+                    .collect();
+
+                let json = format!(
+                    r#"{{"notes":[{}],"total_count":{}}}"#,
+                    notes_json.join(","),
+                    consumable_notes.len()
+                );
+
+                // Allocate stable memory - Swift must call wc_bytes_free
+                let mut bytes = json.into_bytes();
+                let ptr = bytes.as_mut_ptr();
+                let len = bytes.len();
+                std::mem::forget(bytes);
+                callback(user_data_ptr, 0, ptr, len);
+            }
+            Err(_) => {
+                callback(user_data_ptr, -4, std::ptr::null_mut(), 0);
+            }
+        }
+    });
+
+    0
 }
 
 /// Consume Notes
@@ -719,11 +1208,12 @@ pub extern "C" fn wc_miden_consume_notes(
         return -4;
     }
 
-    let context = unsafe { &mut *handle };
+    let context = unsafe { &*handle };
 
     // Build and submit transaction
     let result = block_on(async {
-        consume_notes_async(&mut context.client, account_id, note_ids).await
+        let mut ctx = context.lock().await;
+        consume_notes_async(&mut ctx.client, account_id, note_ids).await
     });
 
     match result {
@@ -748,6 +1238,97 @@ pub extern "C" fn wc_miden_consume_notes(
             }
         }
     }
+}
+
+/// Async version of consume notes
+/// 
+/// # Parameters
+/// - `handle`: Client handle
+/// - `account_id_hex`: Account ID to execute transaction (hex string)
+/// - `note_ids_json`: JSON-formatted array of note IDs
+/// - `callback`: Callback function (user_data, error_code, tx_id_ptr, tx_id_len)
+/// - `user_data`: User data passed to callback
+/// 
+/// # Returns
+/// - 0: Task started successfully
+/// - -1: Invalid parameters
+/// - -2: Invalid handle
+/// - -3: Account ID parsing failed
+/// - -4: Note IDs parsing failed
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_miden_consume_notes_async(
+    handle: MidenHandle,
+    account_id_hex: *const c_char,
+    note_ids_json: *const c_char,
+    callback: ConsumeNotesCallback,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -2;
+    }
+    if account_id_hex.is_null() || note_ids_json.is_null() {
+        return -1;
+    }
+
+    // Parse account ID
+    let account_id_str = match unsafe { CStr::from_ptr(account_id_hex) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let account_id = match AccountId::from_hex(account_id_str) {
+        Ok(id) => id,
+        Err(_) => return -3,
+    };
+
+    // Parse note IDs JSON
+    let note_ids_str = match unsafe { CStr::from_ptr(note_ids_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let note_ids: Vec<NoteId> = match parse_note_ids_json(note_ids_str) {
+        Ok(ids) => ids,
+        Err(_) => return -4,
+    };
+
+    if note_ids.is_empty() {
+        return -4;
+    }
+
+    let handle_usize = handle as usize;
+    let user_data_usize = user_data as usize;
+
+    std::thread::spawn(move || {
+        let handle = handle_usize as MidenHandle;
+        let context = unsafe { &*handle };
+        
+        let result = block_on(async {
+            let mut ctx = context.lock().await;
+            consume_notes_async(&mut ctx.client, account_id, note_ids).await
+        });
+
+        let user_data_ptr = user_data_usize as *mut std::ffi::c_void;
+        match result {
+            Ok(tx_id_hex) => {
+                // Allocate stable memory - Swift must call wc_bytes_free
+                let mut bytes = tx_id_hex.into_bytes();
+                let ptr = bytes.as_mut_ptr();
+                let len = bytes.len();
+                std::mem::forget(bytes);
+                callback(user_data_ptr, 0, ptr, len);
+            }
+            Err(e) => {
+                let error_code = if e.contains("request") || e.contains("build") {
+                    -5
+                } else {
+                    -6
+                };
+                callback(user_data_ptr, error_code, std::ptr::null_mut(), 0);
+            }
+        }
+    });
+
+    0
 }
 
 /// Parse note IDs JSON array

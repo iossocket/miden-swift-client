@@ -583,3 +583,414 @@ public struct InputNotesResult: Codable {
         !notes.isEmpty
     }
 }
+
+// MARK: - Async/Await Extensions
+
+extension MidenWallet {
+    
+    /// Async version of sync - sync blockchain state
+    ///
+    /// - Returns: Latest block number
+    /// - Throws: If sync fails
+    public func syncAsync() async throws -> UInt32 {
+        guard let h = handle else {
+            throw MidenError.invalidHandle
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let continuationPtr = Unmanaged.passRetained(
+                ContinuationBox(continuation: continuation)
+            ).toOpaque()
+            
+            let result = wc_miden_sync_async(h, { userData, errorCode, blockNum in
+                guard let userData = userData else { return }
+                let box = Unmanaged<ContinuationBox<UInt32>>.fromOpaque(userData).takeRetainedValue()
+                
+                if errorCode == 0 {
+                    box.continuation.resume(returning: blockNum)
+                } else {
+                    box.continuation.resume(throwing: MidenError.syncFailed(code: errorCode))
+                }
+            }, continuationPtr)
+            
+            if result != 0 {
+                let box = Unmanaged<ContinuationBox<UInt32>>.fromOpaque(continuationPtr).takeRetainedValue()
+                box.continuation.resume(throwing: MidenError.syncFailed(code: result))
+            }
+        }
+    }
+    
+    /// Async version of createWallet - create a new wallet account
+    ///
+    /// - Parameter seed: 32-byte seed (optional, nil auto-generates)
+    /// - Returns: Account ID (hex string)
+    /// - Throws: If creation fails
+    public func createWalletAsync(seed: [UInt8]? = nil) async throws -> String {
+        guard let h = handle else {
+            throw MidenError.invalidHandle
+        }
+        
+        // Validate seed if provided
+        if let seed = seed, seed.count != 32 {
+            throw MidenError.invalidSeedLength
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let continuationPtr = Unmanaged.passRetained(
+                ContinuationBox(continuation: continuation)
+            ).toOpaque()
+            
+            let result: Int32
+            if let seed = seed {
+                result = seed.withUnsafeBytes { seedBytes in
+                    wc_miden_create_wallet_async(
+                        h,
+                        seedBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(seed.count),
+                        { userData, errorCode, dataPtr, dataLen in
+                            guard let userData = userData else { return }
+                            let box = Unmanaged<ContinuationBox<String>>.fromOpaque(userData).takeRetainedValue()
+                            
+                            if errorCode == 0, let dataPtr = dataPtr, dataLen > 0 {
+                                let data = Data(bytes: dataPtr, count: Int(dataLen))
+                                // Free Rust-allocated memory
+                                wc_bytes_free(dataPtr, dataLen)
+                                if let str = String(data: data, encoding: .utf8) {
+                                    box.continuation.resume(returning: str)
+                                } else {
+                                    box.continuation.resume(throwing: MidenError.invalidAccountId)
+                                }
+                            } else {
+                                box.continuation.resume(throwing: MidenError.createWalletFailed(code: errorCode))
+                            }
+                        },
+                        continuationPtr
+                    )
+                }
+            } else {
+                result = wc_miden_create_wallet_async(
+                    h,
+                    nil,
+                    0,
+                    { userData, errorCode, dataPtr, dataLen in
+                        guard let userData = userData else { return }
+                        let box = Unmanaged<ContinuationBox<String>>.fromOpaque(userData).takeRetainedValue()
+                        
+                        if errorCode == 0, let dataPtr = dataPtr, dataLen > 0 {
+                            let data = Data(bytes: dataPtr, count: Int(dataLen))
+                            // Free Rust-allocated memory
+                            wc_bytes_free(dataPtr, dataLen)
+                            if let str = String(data: data, encoding: .utf8) {
+                                box.continuation.resume(returning: str)
+                            } else {
+                                box.continuation.resume(throwing: MidenError.invalidAccountId)
+                            }
+                        } else {
+                            box.continuation.resume(throwing: MidenError.createWalletFailed(code: errorCode))
+                        }
+                    },
+                    continuationPtr
+                )
+            }
+            
+            if result != 0 {
+                let box = Unmanaged<ContinuationBox<String>>.fromOpaque(continuationPtr).takeRetainedValue()
+                box.continuation.resume(throwing: MidenError.createWalletFailed(code: result))
+            }
+        }
+    }
+    
+    /// Async version of getAccounts - get all accounts list
+    ///
+    /// - Returns: Array of account IDs
+    /// - Throws: If retrieval fails
+    public func getAccountsAsync() async throws -> [String] {
+        guard let h = handle else {
+            throw MidenError.invalidHandle
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let continuationPtr = Unmanaged.passRetained(
+                ContinuationBox(continuation: continuation)
+            ).toOpaque()
+            
+            let result = wc_miden_get_accounts_async(h, { userData, errorCode, dataPtr, dataLen in
+                guard let userData = userData else { return }
+                let box = Unmanaged<ContinuationBox<[String]>>.fromOpaque(userData).takeRetainedValue()
+                
+                if errorCode == 0, let dataPtr = dataPtr, dataLen > 0 {
+                    let data = Data(bytes: dataPtr, count: Int(dataLen))
+                    // Free Rust-allocated memory
+                    wc_bytes_free(dataPtr, dataLen)
+                    if let jsonString = String(data: data, encoding: .utf8),
+                       let jsonData = jsonString.data(using: .utf8) {
+                        do {
+                            let accounts = try JSONDecoder().decode([String].self, from: jsonData)
+                            box.continuation.resume(returning: accounts)
+                        } catch {
+                            box.continuation.resume(throwing: MidenError.jsonDecodeFailed(error: error))
+                        }
+                    } else {
+                        box.continuation.resume(throwing: MidenError.invalidJSON)
+                    }
+                } else {
+                    box.continuation.resume(throwing: MidenError.getAccountsFailed(code: errorCode))
+                }
+            }, continuationPtr)
+            
+            if result != 0 {
+                let box = Unmanaged<ContinuationBox<[String]>>.fromOpaque(continuationPtr).takeRetainedValue()
+                box.continuation.resume(throwing: MidenError.getAccountsFailed(code: result))
+            }
+        }
+    }
+    
+    /// Async version of getBalance - get account balance
+    ///
+    /// - Parameter accountId: Account ID (hex string)
+    /// - Returns: Account balance information
+    /// - Throws: If retrieval fails
+    public func getBalanceAsync(accountId: String) async throws -> AccountBalance {
+        guard let h = handle else {
+            throw MidenError.invalidHandle
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let continuationPtr = Unmanaged.passRetained(
+                ContextContinuationBox(continuation: continuation, context: accountId)
+            ).toOpaque()
+            
+            let result = accountId.withCString { accountIdPtr in
+                wc_miden_get_balance_async(h, accountIdPtr, { userData, errorCode, dataPtr, dataLen in
+                    guard let userData = userData else { return }
+                    let box = Unmanaged<ContextContinuationBox<AccountBalance, String>>.fromOpaque(userData).takeRetainedValue()
+                    
+                    if errorCode == 0, let dataPtr = dataPtr, dataLen > 0 {
+                        let data = Data(bytes: dataPtr, count: Int(dataLen))
+                        // Free Rust-allocated memory
+                        wc_bytes_free(dataPtr, dataLen)
+                        if let jsonString = String(data: data, encoding: .utf8),
+                           let jsonData = jsonString.data(using: .utf8) {
+                            do {
+                                let balance = try JSONDecoder().decode(AccountBalance.self, from: jsonData)
+                                box.continuation.resume(returning: balance)
+                            } catch {
+                                box.continuation.resume(throwing: MidenError.jsonDecodeFailed(error: error))
+                            }
+                        } else {
+                            box.continuation.resume(throwing: MidenError.invalidJSON)
+                        }
+                    } else if errorCode == -4 {
+                        box.continuation.resume(throwing: MidenError.accountNotFound(accountId: box.context))
+                    } else {
+                        box.continuation.resume(throwing: MidenError.getBalanceFailed(code: errorCode))
+                    }
+                }, continuationPtr)
+            }
+            
+            if result != 0 {
+                let box = Unmanaged<ContextContinuationBox<AccountBalance, String>>.fromOpaque(continuationPtr).takeRetainedValue()
+                if result == -3 {
+                    box.continuation.resume(throwing: MidenError.invalidAccountId)
+                } else {
+                    box.continuation.resume(throwing: MidenError.getBalanceFailed(code: result))
+                }
+            }
+        }
+    }
+    
+    /// Async version of testConnection - test network connection
+    ///
+    /// - Returns: Whether connection succeeded
+    /// - Throws: If test fails
+    public func testConnectionAsync() async throws -> Bool {
+        guard let h = handle else {
+            throw MidenError.invalidHandle
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let continuationPtr = Unmanaged.passRetained(
+                ContinuationBox(continuation: continuation)
+            ).toOpaque()
+            
+            let result = wc_miden_test_connection_async(h, { userData, errorCode in
+                guard let userData = userData else { return }
+                let box = Unmanaged<ContinuationBox<Bool>>.fromOpaque(userData).takeRetainedValue()
+                
+                if errorCode == 0 {
+                    box.continuation.resume(returning: true)
+                } else {
+                    box.continuation.resume(throwing: MidenError.connectionTestFailed(code: errorCode))
+                }
+            }, continuationPtr)
+            
+            if result != 0 {
+                let box = Unmanaged<ContinuationBox<Bool>>.fromOpaque(continuationPtr).takeRetainedValue()
+                box.continuation.resume(throwing: MidenError.connectionTestFailed(code: result))
+            }
+        }
+    }
+    
+    /// Async version of getInputNotes - get consumable Input Notes
+    ///
+    /// - Parameter accountId: Account ID (hex string, nil for all accounts)
+    /// - Returns: Input notes result
+    /// - Throws: If retrieval fails
+    public func getInputNotesAsync(accountId: String? = nil) async throws -> InputNotesResult {
+        guard let h = handle else {
+            throw MidenError.invalidHandle
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let continuationPtr = Unmanaged.passRetained(
+                ContinuationBox(continuation: continuation)
+            ).toOpaque()
+            
+            let result: Int32
+            if let accountId = accountId {
+                result = accountId.withCString { accountIdPtr in
+                    wc_miden_get_input_notes_async(h, accountIdPtr, { userData, errorCode, dataPtr, dataLen in
+                        guard let userData = userData else { return }
+                        let box = Unmanaged<ContinuationBox<InputNotesResult>>.fromOpaque(userData).takeRetainedValue()
+                        
+                        if errorCode == 0, let dataPtr = dataPtr, dataLen > 0 {
+                            let data = Data(bytes: dataPtr, count: Int(dataLen))
+                            // Free Rust-allocated memory
+                            wc_bytes_free(dataPtr, dataLen)
+                            if let jsonString = String(data: data, encoding: .utf8),
+                               let jsonData = jsonString.data(using: .utf8) {
+                                do {
+                                    let notes = try JSONDecoder().decode(InputNotesResult.self, from: jsonData)
+                                    box.continuation.resume(returning: notes)
+                                } catch {
+                                    box.continuation.resume(throwing: MidenError.jsonDecodeFailed(error: error))
+                                }
+                            } else {
+                                box.continuation.resume(throwing: MidenError.invalidJSON)
+                            }
+                        } else {
+                            box.continuation.resume(throwing: MidenError.getInputNotesFailed(code: errorCode))
+                        }
+                    }, continuationPtr)
+                }
+            } else {
+                result = wc_miden_get_input_notes_async(h, nil, { userData, errorCode, dataPtr, dataLen in
+                    guard let userData = userData else { return }
+                    let box = Unmanaged<ContinuationBox<InputNotesResult>>.fromOpaque(userData).takeRetainedValue()
+                    
+                    if errorCode == 0, let dataPtr = dataPtr, dataLen > 0 {
+                        let data = Data(bytes: dataPtr, count: Int(dataLen))
+                        // Free Rust-allocated memory
+                        wc_bytes_free(dataPtr, dataLen)
+                        if let jsonString = String(data: data, encoding: .utf8),
+                           let jsonData = jsonString.data(using: .utf8) {
+                            do {
+                                let notes = try JSONDecoder().decode(InputNotesResult.self, from: jsonData)
+                                box.continuation.resume(returning: notes)
+                            } catch {
+                                box.continuation.resume(throwing: MidenError.jsonDecodeFailed(error: error))
+                            }
+                        } else {
+                            box.continuation.resume(throwing: MidenError.invalidJSON)
+                        }
+                    } else {
+                        box.continuation.resume(throwing: MidenError.getInputNotesFailed(code: errorCode))
+                    }
+                }, continuationPtr)
+            }
+            
+            if result != 0 {
+                let box = Unmanaged<ContinuationBox<InputNotesResult>>.fromOpaque(continuationPtr).takeRetainedValue()
+                if result == -3 {
+                    box.continuation.resume(throwing: MidenError.invalidAccountId)
+                } else {
+                    box.continuation.resume(throwing: MidenError.getInputNotesFailed(code: result))
+                }
+            }
+        }
+    }
+    
+    /// Async version of consumeNotes - consume notes
+    ///
+    /// - Parameters:
+    ///   - accountId: Account ID to execute transaction
+    ///   - noteIds: Array of note IDs to consume
+    /// - Returns: Transaction ID
+    /// - Throws: If consumption fails
+    public func consumeNotesAsync(accountId: String, noteIds: [String]) async throws -> String {
+        guard let h = handle else {
+            throw MidenError.invalidHandle
+        }
+        
+        guard !noteIds.isEmpty else {
+            throw MidenError.emptyNoteIds
+        }
+        
+        let noteIdsJson = "[" + noteIds.map { "\"\($0)\"" }.joined(separator: ",") + "]"
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let continuationPtr = Unmanaged.passRetained(
+                ContinuationBox(continuation: continuation)
+            ).toOpaque()
+            
+            let result = accountId.withCString { accountIdPtr in
+                noteIdsJson.withCString { noteIdsPtr in
+                    wc_miden_consume_notes_async(h, accountIdPtr, noteIdsPtr, { userData, errorCode, dataPtr, dataLen in
+                        guard let userData = userData else { return }
+                        let box = Unmanaged<ContinuationBox<String>>.fromOpaque(userData).takeRetainedValue()
+                        
+                        if errorCode == 0, let dataPtr = dataPtr, dataLen > 0 {
+                            let data = Data(bytes: dataPtr, count: Int(dataLen))
+                            // Free Rust-allocated memory
+                            wc_bytes_free(dataPtr, dataLen)
+                            if let str = String(data: data, encoding: .utf8) {
+                                box.continuation.resume(returning: str)
+                            } else {
+                                box.continuation.resume(throwing: MidenError.invalidJSON)
+                            }
+                        } else if errorCode == -5 {
+                            box.continuation.resume(throwing: MidenError.consumeNotesFailed(code: errorCode, message: "Transaction creation failed"))
+                        } else if errorCode == -6 {
+                            box.continuation.resume(throwing: MidenError.consumeNotesFailed(code: errorCode, message: "Transaction submission failed"))
+                        } else {
+                            box.continuation.resume(throwing: MidenError.consumeNotesFailed(code: errorCode, message: nil))
+                        }
+                    }, continuationPtr)
+                }
+            }
+            
+            if result != 0 {
+                let box = Unmanaged<ContinuationBox<String>>.fromOpaque(continuationPtr).takeRetainedValue()
+                if result == -3 {
+                    box.continuation.resume(throwing: MidenError.invalidAccountId)
+                } else if result == -4 {
+                    box.continuation.resume(throwing: MidenError.invalidNoteId)
+                } else {
+                    box.continuation.resume(throwing: MidenError.consumeNotesFailed(code: result, message: nil))
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Helper Types for Async
+
+/// Box type to hold continuation for passing through C callback
+private final class ContinuationBox<T> {
+    let continuation: CheckedContinuation<T, Error>
+    
+    init(continuation: CheckedContinuation<T, Error>) {
+        self.continuation = continuation
+    }
+}
+
+/// Box type with additional context for C callbacks that need extra data
+private final class ContextContinuationBox<T, C> {
+    let continuation: CheckedContinuation<T, Error>
+    let context: C
+    
+    init(continuation: CheckedContinuation<T, Error>, context: C) {
+        self.continuation = continuation
+        self.context = context
+    }
+}
