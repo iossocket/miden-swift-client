@@ -24,6 +24,11 @@ typedef struct Arc_Mutex_MidenContext *MidenHandle;
 typedef void (*SyncCallback)(void*, int32_t, uint32_t);
 
 /**
+ * Callback for test connection operation: (user_data, error_code)
+ */
+typedef void (*TestConnectionCallback)(void*, int32_t);
+
+/**
  * Callback for create wallet operation: (user_data, error_code, account_id_ptr, account_id_len)
  * Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
  */
@@ -40,11 +45,6 @@ typedef void (*GetAccountsCallback)(void*, int32_t, uint8_t*, uintptr_t);
  * Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
  */
 typedef void (*GetBalanceCallback)(void*, int32_t, uint8_t*, uintptr_t);
-
-/**
- * Callback for test connection operation: (user_data, error_code)
- */
-typedef void (*TestConnectionCallback)(void*, int32_t);
 
 /**
  * Callback for get input notes operation: (user_data, error_code, json_ptr, json_len)
@@ -126,6 +126,35 @@ int32_t wc_miden_sync(MidenHandle handle, uint32_t *block_num_out);
  * - -1: Invalid handle or callback
  */
 int32_t wc_miden_sync_async(MidenHandle handle, SyncCallback callback, void *user_data);
+
+/**
+ * Test Miden Client connection
+ *
+ * # Parameters
+ * - `handle`: Client handle
+ *
+ * # Returns
+ * - 0: Connection OK
+ * - -1: Invalid handle
+ * - -2: Connection failed
+ */
+int32_t wc_miden_test_connection(MidenHandle handle);
+
+/**
+ * Async version of test connection
+ *
+ * # Parameters
+ * - `handle`: Client handle
+ * - `callback`: Callback function (user_data, error_code)
+ * - `user_data`: User data passed to callback
+ *
+ * # Returns
+ * - 0: Task started successfully
+ * - -1: Invalid handle
+ */
+int32_t wc_miden_test_connection_async(MidenHandle handle,
+                                       TestConnectionCallback callback,
+                                       void *user_data);
 
 /**
  * Create a new Miden wallet account
@@ -259,35 +288,6 @@ int32_t wc_miden_get_balance_async(MidenHandle handle,
                                    const char *account_id_hex,
                                    GetBalanceCallback callback,
                                    void *user_data);
-
-/**
- * Test Miden Client connection
- *
- * # Parameters
- * - `handle`: Client handle
- *
- * # Returns
- * - 0: Connection OK
- * - -1: Invalid handle
- * - -2: Connection failed
- */
-int32_t wc_miden_test_connection(MidenHandle handle);
-
-/**
- * Async version of test connection
- *
- * # Parameters
- * - `handle`: Client handle
- * - `callback`: Callback function (user_data, error_code)
- * - `user_data`: User data passed to callback
- *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid handle
- */
-int32_t wc_miden_test_connection_async(MidenHandle handle,
-                                       TestConnectionCallback callback,
-                                       void *user_data);
 
 /**
  * Get consumable Input Notes
