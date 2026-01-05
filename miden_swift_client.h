@@ -10,13 +10,61 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-typedef struct Arc_Mutex_MidenContext Arc_Mutex_MidenContext;
+/**
+ * Maximum number of pending requests in the worker queue
+ * Prevents unbounded memory growth if caller spams requests
+ */
+#define WORKER_QUEUE_CAPACITY 256
 
 /**
- * Opaque handle type
- * Points to Arc<Mutex<MidenContext>> for thread-safe access
+ * Error: invalid parameter
  */
-typedef struct Arc_Mutex_MidenContext *MidenHandle;
+#define ERR_INVALID_PARAM -1
+
+/**
+ * Error: invalid handle or worker closed
+ */
+#define ERR_INVALID_HANDLE -2
+
+/**
+ * Error: account/key operation failed
+ */
+#define ERR_ACCOUNT_OP -3
+
+/**
+ * Error: note operation failed
+ */
+#define ERR_NOTE_OP -4
+
+/**
+ * Error: balance/account lookup failed
+ */
+#define ERR_LOOKUP -5
+
+/**
+ * Error: transaction submission failed
+ */
+#define ERR_TX_SUBMIT -6
+
+/**
+ * Error: worker queue is full
+ */
+#define ERR_QUEUE_FULL -8
+
+/**
+ * Error: operation timed out
+ */
+#define ERR_TIMEOUT -99
+
+/**
+ * Handle structure containing sender to worker thread
+ */
+typedef struct MidenWorkerHandle MidenWorkerHandle;
+
+/**
+ * Opaque handle type for FFI
+ */
+typedef struct MidenWorkerHandle *MidenHandle;
 
 /**
  * Callback for sync operation: (user_data, error_code, block_num)
@@ -25,19 +73,16 @@ typedef void (*SyncCallback)(void*, int32_t, uint32_t);
 
 /**
  * Callback for create wallet operation: (user_data, error_code, account_id_ptr, account_id_len)
- * Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
  */
 typedef void (*CreateWalletCallback)(void*, int32_t, uint8_t*, uintptr_t);
 
 /**
  * Callback for get accounts operation: (user_data, error_code, json_ptr, json_len)
- * Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
  */
 typedef void (*GetAccountsCallback)(void*, int32_t, uint8_t*, uintptr_t);
 
 /**
  * Callback for get balance operation: (user_data, error_code, json_ptr, json_len)
- * Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
  */
 typedef void (*GetBalanceCallback)(void*, int32_t, uint8_t*, uintptr_t);
 
@@ -48,25 +93,27 @@ typedef void (*TestConnectionCallback)(void*, int32_t);
 
 /**
  * Callback for get input notes operation: (user_data, error_code, json_ptr, json_len)
- * Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
  */
 typedef void (*GetInputNotesCallback)(void*, int32_t, uint8_t*, uintptr_t);
 
 /**
  * Callback for consume notes operation: (user_data, error_code, tx_id_ptr, tx_id_len)
- * Note: Swift must call wc_bytes_free(ptr, len) to free the returned data
  */
 typedef void (*ConsumeNotesCallback)(void*, int32_t, uint8_t*, uintptr_t);
 
 /**
  * Free bytes allocated by Rust (for async callback results)
  *
- * Swift must call this to free data returned via async callbacks
+ * MUST be called to release memory returned by async callbacks.
+ * The (ptr, len) pair must match exactly what was returned by the callback.
  */
 void wc_bytes_free(uint8_t *ptr, uintptr_t len);
 
 /**
  * Create and initialize Miden Client
+ *
+ * This starts a dedicated worker thread that owns the MidenClient.
+ * All operations are sent to this worker thread via channels.
  *
  * # Parameters
  * - `keystore_path`: Keystore storage directory path (C string)
@@ -78,9 +125,6 @@ void wc_bytes_free(uint8_t *ptr, uintptr_t len);
  * - 0: Success
  * - -1: Invalid parameters
  * - -2: Initialization failed
- *
- * # Note
- * The caller is responsible for calling `wc_miden_destroy` to release resources after use
  */
 int32_t wc_miden_create(const char *keystore_path,
                         const char *store_path,
@@ -90,58 +134,45 @@ int32_t wc_miden_create(const char *keystore_path,
 /**
  * Destroy client and release resources
  *
- * # Parameters
- * - `handle`: Client handle
+ * Sends shutdown signal to worker thread and waits for it to finish.
+ * Safe to call multiple times - the handle pointer is set to NULL after destruction.
  *
- * # Note
- * Must execute drop in Tokio runtime context, because SQLite connection pool's
- * SyncWrapper::drop needs to call spawn_blocking_background
+ * # Parameters
+ * - `handle_ptr`: Pointer to the handle (will be set to NULL after destruction)
+ *
+ * # Example (Swift)
+ * ```swift
+ * var handle: MidenHandle? = ...
+ * wc_miden_destroy(&handle)  // handle is now nil
+ * ```
+ *
+ * # Shutdown Semantics
+ * This performs a **fast shutdown**: pending requests in the queue will be dropped.
+ * Callbacks for in-flight async operations may not be invoked.
+ * If you need graceful shutdown (process all pending requests), do not use this pattern.
  */
-void wc_miden_destroy(MidenHandle handle);
+void wc_miden_destroy(MidenHandle *handle_ptr);
 
 /**
- * Sync state
+ * Sync state (blocking)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `block_num_out`: Output latest block number (can be NULL)
+ * WARNING: This is a blocking call. Do NOT call from the main/UI thread.
+ * Use wc_miden_sync_async for non-blocking operation.
+ *
+ * NOTE: Timeout (-99) only abandons waiting; the operation may still complete in background.
  *
  * # Returns
  * - 0: Success
- * - -1: Invalid handle
- * - -2: Sync failed
+ * - -2: Invalid handle or worker closed
+ * - -8: Queue full
+ * - -99: Operation timed out
  */
 int32_t wc_miden_sync(MidenHandle handle, uint32_t *block_num_out);
 
 /**
- * Async version of sync state
+ * Create a new wallet account (blocking)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `callback`: Callback function (user_data, error_code, block_num)
- * - `user_data`: User data passed to callback
- *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid handle or callback
- */
-int32_t wc_miden_sync_async(MidenHandle handle, SyncCallback callback, void *user_data);
-
-/**
- * Create a new Miden wallet account
- *
- * # Parameters
- * - `handle`: Client handle
- * - `seed_ptr`: 32-byte random seed (if NULL, auto-generated)
- * - `seed_len`: Seed length (must be 32, ignored if seed_ptr is NULL)
- * - `account_id_out`: Output buffer for account ID (at least 64 bytes for hex string)
- * - `account_id_out_len`: Input as buffer size, output as actual length
- *
- * # Returns
- * - 0: Success
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Account creation failed
+ * WARNING: This is a blocking call. Do NOT call from the main/UI thread.
  */
 int32_t wc_miden_create_wallet(MidenHandle handle,
                                const uint8_t *seed_ptr,
@@ -150,90 +181,18 @@ int32_t wc_miden_create_wallet(MidenHandle handle,
                                uintptr_t *account_id_out_len);
 
 /**
- * Async version of create wallet
+ * Get all accounts (blocking)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `seed_ptr`: 32-byte random seed (if NULL, auto-generated)
- * - `seed_len`: Seed length (must be 32, ignored if seed_ptr is NULL)
- * - `callback`: Callback function (user_data, error_code, account_id_ptr, account_id_len)
- * - `user_data`: User data passed to callback
- *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid parameters
- * - -2: Invalid handle
- */
-int32_t wc_miden_create_wallet_async(MidenHandle handle,
-                                     const uint8_t *seed_ptr,
-                                     uintptr_t seed_len,
-                                     CreateWalletCallback callback,
-                                     void *user_data);
-
-/**
- * Get all accounts list
- *
- * # Parameters
- * - `handle`: Client handle
- * - `accounts_json_out`: Output buffer for JSON-formatted account list
- * - `accounts_json_out_len`: Input as buffer size, output as actual length
- *
- * # Returns
- * - 0: Success
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Get failed
+ * WARNING: This is a blocking call. Do NOT call from the main/UI thread.
  */
 int32_t wc_miden_get_accounts(MidenHandle handle,
                               uint8_t *accounts_json_out,
                               uintptr_t *accounts_json_out_len);
 
 /**
- * Async version of get accounts
+ * Get account balance (blocking)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `callback`: Callback function (user_data, error_code, json_ptr, json_len)
- * - `user_data`: User data passed to callback
- *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid handle
- */
-int32_t wc_miden_get_accounts_async(MidenHandle handle,
-                                    GetAccountsCallback callback,
-                                    void *user_data);
-
-/**
- * Get account balance
- *
- * Returns JSON-formatted information about all assets in the account, including fungible and non-fungible assets.
- *
- * # Parameters
- * - `handle`: Client handle
- * - `account_id_hex`: Account ID (hex string, e.g., "0x...")
- * - `balance_json_out`: Output buffer for JSON-formatted balance information
- * - `balance_json_out_len`: Input as buffer size, output as actual length
- *
- * # Returns
- * - 0: Success
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Account ID parsing failed
- * - -4: Account not found
- * - -5: Get balance failed
- *
- * # JSON 输出格式
- * ```json
- * {
- *   "account_id": "0x...",
- *   "fungible_assets": [
- *     {"faucet_id": "0x...", "amount": 1000}
- *   ],
- *   "total_fungible_count": 1,
- *   "total_non_fungible_count": 0
- * }
- * ```
+ * WARNING: This is a blocking call. Do NOT call from the main/UI thread.
  */
 int32_t wc_miden_get_balance(MidenHandle handle,
                              const char *account_id_hex,
@@ -241,85 +200,16 @@ int32_t wc_miden_get_balance(MidenHandle handle,
                              uintptr_t *balance_json_out_len);
 
 /**
- * Async version of get balance
+ * Test connection (blocking)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `account_id_hex`: Account ID (hex string)
- * - `callback`: Callback function (user_data, error_code, json_ptr, json_len)
- * - `user_data`: User data passed to callback
- *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Account ID parsing failed
- */
-int32_t wc_miden_get_balance_async(MidenHandle handle,
-                                   const char *account_id_hex,
-                                   GetBalanceCallback callback,
-                                   void *user_data);
-
-/**
- * Test Miden Client connection
- *
- * # Parameters
- * - `handle`: Client handle
- *
- * # Returns
- * - 0: Connection OK
- * - -1: Invalid handle
- * - -2: Connection failed
+ * WARNING: This is a blocking call. Do NOT call from the main/UI thread.
  */
 int32_t wc_miden_test_connection(MidenHandle handle);
 
 /**
- * Async version of test connection
+ * Get consumable input notes (blocking)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `callback`: Callback function (user_data, error_code)
- * - `user_data`: User data passed to callback
- *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid handle
- */
-int32_t wc_miden_test_connection_async(MidenHandle handle,
-                                       TestConnectionCallback callback,
-                                       void *user_data);
-
-/**
- * Get consumable Input Notes
- *
- * Returns all consumable notes (unspent, committed notes).
- *
- * # Parameters
- * - `handle`: Client handle
- * - `account_id_hex`: Account ID (hex string, can be NULL to get notes for all accounts)
- * - `notes_json_out`: Output buffer for JSON-formatted notes list
- * - `notes_json_out_len`: Input as buffer size, output as actual length
- *
- * # Returns
- * - 0: Success
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Account ID parsing failed
- * - -4: Get failed
- *
- * # JSON 输出格式
- * ```json
- * {
- *   "notes": [
- *     {
- *       "note_id": "0x...",
- *       "assets": [{"faucet_id": "0x...", "amount": 1000}],
- *       "is_authenticated": true
- *     }
- *   ],
- *   "total_count": 1
- * }
- * ```
+ * WARNING: This is a blocking call. Do NOT call from the main/UI thread.
  */
 int32_t wc_miden_get_input_notes(MidenHandle handle,
                                  const char *account_id_hex,
@@ -327,45 +217,10 @@ int32_t wc_miden_get_input_notes(MidenHandle handle,
                                  uintptr_t *notes_json_out_len);
 
 /**
- * Async version of get input notes
+ * Consume notes (blocking)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `account_id_hex`: Account ID (hex string, can be NULL for all accounts)
- * - `callback`: Callback function (user_data, error_code, json_ptr, json_len)
- * - `user_data`: User data passed to callback
- *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Account ID parsing failed
- */
-int32_t wc_miden_get_input_notes_async(MidenHandle handle,
-                                       const char *account_id_hex,
-                                       GetInputNotesCallback callback,
-                                       void *user_data);
-
-/**
- * Consume Notes
- *
- * Create and submit a transaction to consume specified notes.
- *
- * # Parameters
- * - `handle`: Client handle
- * - `account_id_hex`: Account ID to execute transaction (hex string)
- * - `note_ids_json`: JSON-formatted array of note IDs (e.g., `["0x...", "0x..."]`)
- * - `tx_id_out`: Output buffer for transaction ID (at least 64 bytes)
- * - `tx_id_out_len`: Input as buffer size, output as actual length
- *
- * # Returns
- * - 0: Success
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Account ID parsing failed
- * - -4: Note IDs parsing failed
- * - -5: Transaction creation failed
- * - -6: Transaction submission failed
+ * WARNING: This is a blocking call. Do NOT call from the main/UI thread.
+ * NOTE: Timeout (-99) only abandons waiting; the transaction may still be submitted.
  */
 int32_t wc_miden_consume_notes(MidenHandle handle,
                                const char *account_id_hex,
@@ -374,21 +229,66 @@ int32_t wc_miden_consume_notes(MidenHandle handle,
                                uintptr_t *tx_id_out_len);
 
 /**
- * Async version of consume notes
+ * Sync state (async)
  *
- * # Parameters
- * - `handle`: Client handle
- * - `account_id_hex`: Account ID to execute transaction (hex string)
- * - `note_ids_json`: JSON-formatted array of note IDs
- * - `callback`: Callback function (user_data, error_code, tx_id_ptr, tx_id_len)
- * - `user_data`: User data passed to callback
+ * NOTE: Callback is invoked on worker thread, NOT main thread.
+ * Swift callers should dispatch to main queue if updating UI.
+ */
+int32_t wc_miden_sync_async(MidenHandle handle, SyncCallback callback, void *user_data);
+
+/**
+ * Create wallet (async)
  *
- * # Returns
- * - 0: Task started successfully
- * - -1: Invalid parameters
- * - -2: Invalid handle
- * - -3: Account ID parsing failed
- * - -4: Note IDs parsing failed
+ * NOTE: Callback is invoked on worker thread, NOT main thread.
+ */
+int32_t wc_miden_create_wallet_async(MidenHandle handle,
+                                     const uint8_t *seed_ptr,
+                                     uintptr_t seed_len,
+                                     CreateWalletCallback callback,
+                                     void *user_data);
+
+/**
+ * Get accounts (async)
+ *
+ * NOTE: Callback is invoked on worker thread, NOT main thread.
+ */
+int32_t wc_miden_get_accounts_async(MidenHandle handle,
+                                    GetAccountsCallback callback,
+                                    void *user_data);
+
+/**
+ * Get balance (async)
+ *
+ * NOTE: Callback is invoked on worker thread, NOT main thread.
+ */
+int32_t wc_miden_get_balance_async(MidenHandle handle,
+                                   const char *account_id_hex,
+                                   GetBalanceCallback callback,
+                                   void *user_data);
+
+/**
+ * Test connection (async)
+ *
+ * NOTE: Callback is invoked on worker thread, NOT main thread.
+ */
+int32_t wc_miden_test_connection_async(MidenHandle handle,
+                                       TestConnectionCallback callback,
+                                       void *user_data);
+
+/**
+ * Get input notes (async)
+ *
+ * NOTE: Callback is invoked on worker thread, NOT main thread.
+ */
+int32_t wc_miden_get_input_notes_async(MidenHandle handle,
+                                       const char *account_id_hex,
+                                       GetInputNotesCallback callback,
+                                       void *user_data);
+
+/**
+ * Consume notes (async)
+ *
+ * NOTE: Callback is invoked on worker thread, NOT main thread.
  */
 int32_t wc_miden_consume_notes_async(MidenHandle handle,
                                      const char *account_id_hex,
@@ -396,13 +296,26 @@ int32_t wc_miden_consume_notes_async(MidenHandle handle,
                                      ConsumeNotesCallback callback,
                                      void *user_data);
 
+/**
+ * Keccak256 hash function
+ *
+ * # Parameters
+ * - `data_ptr`: Input data pointer
+ * - `data_len`: Input data length
+ * - `out_ptr`: Output buffer pointer (must be at least 32 bytes)
+ * - `out_len`: Input: buffer capacity; Output: actual length (32)
+ *
+ * # Returns
+ * - 0: Success
+ * - -1: Invalid parameters or buffer too small
+ */
 int32_t wc_keccak256(const uint8_t *data_ptr,
                      uintptr_t data_len,
                      uint8_t *out_ptr,
                      uintptr_t *out_len);
 
 /**
- * Convert account ID to hex string
+ * Convert account ID bytes to hex string
  */
 int32_t wc_miden_account_id_to_hex(const uint8_t *account_id_ptr,
                                    uintptr_t account_id_len,

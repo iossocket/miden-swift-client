@@ -104,9 +104,9 @@ public class MidenWallet {
     }
     
     deinit {
-        if let h = handle {
-            wc_miden_destroy(h)
-        }
+        // wc_miden_destroy takes a pointer to handle and sets it to NULL
+        // This prevents double-free if deinit is called multiple times
+        wc_miden_destroy(&handle)
     }
     
     // MARK: - Public Methods
